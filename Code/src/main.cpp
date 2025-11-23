@@ -3,6 +3,7 @@
 #include <ESPmDNS.h>
 #include <Wire.h>
 #include <Adafruit_MAX1704X.h>
+#include <LittleFS.h>
 
 // J6-J3 FR BR BL FL
 
@@ -14,10 +15,10 @@ const char* mDNS = "hrccp";
 // sets the web server port number to 80
 WiFiServer server(80);
 
-// buzzer is on GPIO 32
+// ESP32 Pin Definitions
+
 const int BUZZER_PIN = 32;
 
-// motor pins
 const int FR_MODE_PIN = 23;
 const int FR_PH_PIN = 25;
 const int FR_EN_PIN = 26;
@@ -34,12 +35,23 @@ const int FL_MODE_PIN = 13;
 const int FL_PH_PIN = 14;
 const int FL_EN_PIN = 15;
 
-// Buck Boost Power Good pin
 const int PG_PIN = 39;
 
-// MXC400xXC I2C pins (named for accel so they are clearly associated)
-const int ACCEL_I2C_SDA_PIN = 5; // SDA on GPIO5 (accel)
-const int ACCEL_I2C_SCL_PIN = 4; // SCL on GPIO4 (accel)
+const int ACCEL_I2C_SDA_PIN = 5;
+const int ACCEL_I2C_SCL_PIN = 4;
+
+// HTML Definitions
+
+// client timing
+unsigned long currentTime = millis();
+unsigned long previousTime = 0;
+const long timeoutTime = 2000;
+
+// Variable to store the HTTP request
+String header;
+
+// Motor Test Button State
+String MotorState = "off";
 
 // Accel axis sign: set to -1 because front of car is -X; set to +1 if you mount differently
 const int ACCEL_X_SIGN = -1;
@@ -84,6 +96,11 @@ float bias_g = 0.0f;
 float vel_m_s = 0.0f;
 float last_acc_ms2 = 0.0f;
 unsigned long last_sample_us = 0;
+
+// exported telemetry for UI (updated by accelLoop() and batteryLoop())
+float last_vel_hp = 0.0f;        // high-pass filtered velocity to show on webpage
+float last_cellPercent = 0.0f;   // battery percentage
+float last_cellVoltage = 0.0f;   // battery voltage (V)
 
 // ----- Battery gauge state -----
 Adafruit_MAX17048 maxlipo;
@@ -159,118 +176,6 @@ void calibrateBias() {
   } else {
     bias_g = 0.0f;
   }
-}
-
-// Forward declarations for accel abstraction (defined below)
-void accelInit();
-void accelLoop();
-// finer-grained accel helpers
-bool accelReadRaw(int16_t &rawOut);
-float accelRawToSignedG(int16_t raw);
-void accelZuptUpdate(float ax_g, unsigned long now, bool &out_is_stationary);
-void accelIntegrate(float ax_ms2, float dt);
-
-// Battery gauge helpers
-void batteryInit();
-void batteryLoop();
-
-void PGLoop();
-
-void setup() {
-
-  // initialize serial 
-  Serial.begin(115200);
-  delay(100);
-  Serial.println();
-  Serial.println("Serial started at 115200");
-
-  // starts the Access Point
-  WiFi.softAP(ssid, password);
-
-  // Sets the IP address of the Access Point
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("AP IP address: ");
-  Serial.println(IP);
-
-  server.begin();
-
-  // Initialize mDNS (best-effort)
-  if (MDNS.begin(mDNS)) {
-    Serial.print("mDNS: ");
-    Serial.println(String(mDNS) + ".local");
-  } else {
-    Serial.println("mDNS begin failed");
-  }
-  
-  // sets the BUZZER_PIN as an output
-  pinMode(BUZZER_PIN, OUTPUT);
-
-
-  // test FR motor
-  pinMode(FR_MODE_PIN, OUTPUT);
-  pinMode(FR_PH_PIN, OUTPUT);
-  pinMode(FR_EN_PIN, OUTPUT);
-  digitalWrite(FR_MODE_PIN, HIGH); // set to PH/EN mode
-  digitalWrite(FR_PH_PIN, HIGH);   // set direction
-  analogWrite(FR_EN_PIN, 255);     // set speed (0-255)
-
-  // test BR motor
-  pinMode(BR_MODE_PIN, OUTPUT);
-  pinMode(BR_PH_PIN, OUTPUT);
-  pinMode(BR_EN_PIN, OUTPUT);
-  digitalWrite(BR_MODE_PIN, HIGH); // set to PH/EN mode
-  digitalWrite(BR_PH_PIN, HIGH);   // set direction
-  analogWrite(BR_EN_PIN, 255);     // set speed (0-255)
-
-  // test BL motor
-  pinMode(BL_MODE_PIN, OUTPUT);
-  pinMode(BL_PH_PIN, OUTPUT);
-  pinMode(BL_EN_PIN, OUTPUT);
-  digitalWrite(BL_MODE_PIN, HIGH); // set to PH/EN mode
-  digitalWrite(BL_PH_PIN, HIGH);   // set direction
-  analogWrite(BL_EN_PIN, 255);     // set speed (0-255)
-
-  // test FL motor
-  pinMode(FL_MODE_PIN, OUTPUT);
-  pinMode(FL_PH_PIN, OUTPUT);
-  pinMode(FL_EN_PIN, OUTPUT);
-  digitalWrite(FL_MODE_PIN, HIGH); // set to PH/EN mode
-  digitalWrite(FL_PH_PIN, HIGH);   // set direction
-  analogWrite(FL_EN_PIN, 255);     // set speed (0-255)
-
-  // sets the PG_PIN as an input
-  pinMode(PG_PIN, INPUT);
-
-  boolean PG = digitalRead(PG_PIN);
-
-  // initialize accelerometer (I2C, address, calibration)
-  accelInit();
-
-  // initialize battery gauge (reuses Wire started by accelInit)
-  batteryInit();
-}
-
-void loop() {
-  WiFiClient client = server.available();   // Listen for incoming clients
-
-  if (client) {                             // If a new client connects,
-    Serial.println("New Client.");          // print a message out in the serial port
-    delay(50);
-  }
-
-  // accel sampling handled in accelLoop()
-  accelLoop();
-
-  // battery polling handled separately (non-blocking)
-  batteryLoop();
-
-  PGLoop();
-
-  // short idle so other tasks (WiFi stack) can run; keep small to allow sampling
-  delay(1);
-
-  //tone(BUZZER_PIN, 2000, 1000);
-  //delay(1000);
 }
 
 void accelInit() {
@@ -393,6 +298,9 @@ void accelLoop() {
         vel_avg = alpha * vel_avg + (1.0f - alpha) * vel_m_s;
         float vel_hp = vel_m_s - vel_avg;
 
+        // export for UI
+        last_vel_hp = vel_hp;
+
         if (DEBUG_MODE) {
           // print columns: raw, raw_g, ax_g, ax_ms2, dt, mean, stddev, vel, vel_hp
           float mean = (zupt_count > 0) ? (zupt_sum / (float)zupt_count) : 0.0f;
@@ -456,6 +364,9 @@ void batteryLoop() {
     Serial.println("Failed to read battery gauge (no battery or gauge hibernating)");
     return;
   }
+  // export for UI
+  last_cellVoltage = cellVoltage;
+  last_cellPercent = cellPercent;
   Serial.print("battery(V): "); Serial.println(cellVoltage, 3);
   Serial.print("battery(%): "); Serial.println(cellPercent, 1);
 }
@@ -464,9 +375,274 @@ void PGLoop() {
   unsigned long now = millis();
   if ((now - last_PG_ms) < PG_POLL_MS) return;
   last_PG_ms = now;
-  if (boolean PG = HIGH) {
+  boolean PG = digitalRead(PG_PIN);
+  if (PG == HIGH) {
     Serial.println("Power Good!");
   } else {
     Serial.println("Power Bad!");
   }
+}
+
+void MotorForward(float pwm) {
+  // set all motors to forward at variable pwm speed
+  digitalWrite(FR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FR_PH_PIN, HIGH);   // set direction
+  analogWrite(FR_EN_PIN, pwm);     // set speed (0-255)
+
+  digitalWrite(BR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BR_PH_PIN, HIGH);   // set direction
+  analogWrite(BR_EN_PIN, pwm);     // set speed (0-255)
+
+  digitalWrite(BL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BL_PH_PIN, HIGH);   // set direction
+  analogWrite(BL_EN_PIN, pwm);     // set speed (0-255)
+
+  digitalWrite(FL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FL_PH_PIN, HIGH);   // set direction
+  analogWrite(FL_EN_PIN, pwm);     // set speed (0-255)
+}
+
+void MotorBrake() {
+  // set all motors to brake (zero speed)
+  digitalWrite(FR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FR_PH_PIN, LOW);   // set direction
+  analogWrite(FR_EN_PIN, 0);     // set speed (0-255)
+
+  digitalWrite(BR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BR_PH_PIN, LOW);   // set direction
+  analogWrite(BR_EN_PIN, 0);     // set speed (0-255)
+
+  digitalWrite(BL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BL_PH_PIN, LOW);   // set direction
+  analogWrite(BL_EN_PIN, 0);     // set speed (0-255)
+
+  digitalWrite(FL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FL_PH_PIN, LOW);   // set direction
+  analogWrite(FL_EN_PIN, 0);     // set speed (0-255)
+}
+
+// Forward declarations for accel abstraction (defined below)
+void accelInit();
+void accelLoop();
+// finer-grained accel helpers
+bool accelReadRaw(int16_t &rawOut);
+float accelRawToSignedG(int16_t raw);
+void accelZuptUpdate(float ax_g, unsigned long now, bool &out_is_stationary);
+void accelIntegrate(float ax_ms2, float dt);
+
+// Battery gauge helpers
+void batteryInit();
+void batteryLoop();
+
+void PGLoop();
+
+void MotorForward(float pwm);
+
+void MotorBrake();
+
+void setup() {
+
+  // initialize serial 
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println("Serial started at 115200");
+
+  // Initialize LittleFS
+  if (!LittleFS.begin()) {
+    Serial.println("An error has occurred while mounting LittleFS");
+  } else {
+    Serial.println("LittleFS mounted successfully");
+  }
+
+  // starts the Access Point
+  WiFi.softAP(ssid, password);
+
+  // Sets the IP address of the Access Point
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  server.begin();
+
+  // Initialize mDNS (best-effort)
+  if (MDNS.begin(mDNS)) {
+    Serial.print("mDNS: ");
+    Serial.println(String(mDNS) + ".local");
+  } else {
+    Serial.println("mDNS begin failed");
+  }
+  
+  // sets the BUZZER_PIN as an output
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // motor pins setup
+  pinMode(FR_MODE_PIN, OUTPUT);
+  pinMode(FR_PH_PIN, OUTPUT);
+  pinMode(FR_EN_PIN, OUTPUT);
+
+  pinMode(BR_MODE_PIN, OUTPUT);
+  pinMode(BR_PH_PIN, OUTPUT);
+  pinMode(BR_EN_PIN, OUTPUT);
+
+  pinMode(BL_MODE_PIN, OUTPUT);
+  pinMode(BL_PH_PIN, OUTPUT);
+  pinMode(BL_EN_PIN, OUTPUT);
+
+  pinMode(FL_MODE_PIN, OUTPUT);
+  pinMode(FL_PH_PIN, OUTPUT);
+  pinMode(FL_EN_PIN, OUTPUT);
+
+/*
+  // test FR motor
+  digitalWrite(FR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FR_PH_PIN, HIGH);   // set direction
+  analogWrite(FR_EN_PIN, 255);     // set speed (0-255)
+
+  // test BR motor
+  digitalWrite(BR_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BR_PH_PIN, HIGH);   // set direction
+  analogWrite(BR_EN_PIN, 255);     // set speed (0-255)
+
+  // test BL motor
+  digitalWrite(BL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(BL_PH_PIN, HIGH);   // set direction
+  analogWrite(BL_EN_PIN, 255);     // set speed (0-255)
+
+  // test FL motor
+  digitalWrite(FL_MODE_PIN, HIGH); // set to PH/EN mode
+  digitalWrite(FL_PH_PIN, HIGH);   // set direction
+  analogWrite(FL_EN_PIN, 255);     // set speed (0-255)
+*/
+
+  // sets the PG_PIN as an input
+  pinMode(PG_PIN, INPUT);
+
+  // initialize accelerometer (I2C, address, calibration)
+  accelInit();
+
+  // initialize battery gauge (reuses Wire started by accelInit)
+  batteryInit();
+
+  // beep to signal ready
+  tone(BUZZER_PIN, 2000, 100);
+}
+
+void loop() {
+  WiFiClient client = server.available();   // Listen for incoming clients
+
+  if (client) {                             // If a new client connects,
+    currentTime = millis();
+    previousTime = currentTime;
+    String currentLine = "";                // make a String to hold incoming data from the client
+    Serial.println("New Client.");          // print a message out in the serial port
+    while (client.connected() && (currentTime - previousTime < timeoutTime)) { // loop while the client's connected
+      currentTime = millis();
+      if (client.available()) {             // if there's bytes to read from the client,
+        char c = client.read();             // read a byte, then
+        Serial.write(c);                    // print it out the serial monitor
+        header += c;
+        if (c == '\n') {                    // if the byte is a newline character
+
+          // if the current line is blank, you got two newline characters in a row.
+          // that's the end of the client HTTP request, so send a response:
+          if (currentLine.length() == 0) {
+
+            if (header.indexOf("GET /motor/on") >= 0) {
+              Serial.println("Motors On");
+              MotorState = "on";
+              MotorForward(127.5);
+            } 
+            if (header.indexOf("GET /motor/off") >= 0) {
+              Serial.println("Motors off");
+              MotorState = "off";
+              MotorBrake();
+            }
+
+            // serve favicon from LittleFS if requested
+            if (header.indexOf("GET /favicon.ico") >= 0) {
+              File fav = LittleFS.open("/favicon.ico", "r");
+              if (fav) {
+                client.println("HTTP/1.1 200 OK");
+                client.println("Content-Type: image/x-icon");
+                client.print("Content-Length: "); client.println(fav.size());
+                client.println("Connection: close");
+                client.println();
+                const size_t bufSize = 128;
+                uint8_t buf[bufSize];
+                while (fav.available()) {
+                  size_t n = fav.read(buf, bufSize);
+                  client.write(buf, n);
+                }
+                fav.close();
+              } else {
+                client.println("HTTP/1.1 404 Not Found");
+                client.println("Content-type:text/plain");
+                client.println();
+                client.println("favicon not found");
+              }
+              client.println();
+              break;
+            }
+
+            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
+            // and a content-type so the client knows what's coming, then a blank line:
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-type:text/html");
+            client.println();
+
+            // the content of the HTTP response follows the header:
+            client.println("<!DOCTYPE html><html>");
+            client.println("<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+            client.println("<link rel=\"icon\" href=\"/favicon.ico\" type=\"image/x-icon\" >");
+
+            // CSS to style the on/off buttons 
+            client.println("<style>html { font-family: Helvetica; display: inline-block; margin: 0px auto; text-align: center;}");
+            client.println(".button { background-color: #2fe0ffff; border: none; color: white; padding: 16px 40px;");
+            client.println("text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}");
+            client.println(".button2 {background-color: #222222ff;}</style></head>");
+            
+            // Web Page Heading
+            client.println("<body><h1>HQ RC Car Control Panel</h1>");
+            
+            // Display current motor state and ON/OFF buttons
+            client.println("<p>Motor State - " + MotorState + "</p>");
+            
+            // display stats
+            client.println("<p>Stats: " + String(last_vel_hp, 2) + " m/s | " + String(last_cellVoltage, 2) + "v | " + String(last_cellPercent, 1) + "%</p>");
+
+            // If the MotorState is off, it displays the ON button       
+            if (MotorState=="off") {
+              client.println("<p><a href=\"/motor/on\"><button class=\"button\">ON</button></a></p>");
+            } else {
+              client.println("<p><a href=\"/motor/off\"><button class=\"button button2\">OFF</button></a></p>");
+            } 
+            client.println("</body></html>");
+
+
+            // The HTTP response ends with another blank line:
+            client.println();
+            break;
+          } else { // if you got a newline, then clear currentLine:
+            currentLine = "";
+          }
+        } else if (c != '\r') {  // if you got anything else but a carriage return character,
+          currentLine += c;      // add it to the end of the currentLine
+        }
+      }
+    }
+    // Clear the header variable
+    header = "";
+  }
+
+  // accel sampling handled in accelLoop()
+  accelLoop();
+
+  // battery polling handled separately (non-blocking)
+  batteryLoop();
+
+  PGLoop();
+
+  // short idle so other tasks (WiFi stack) can run; keep small to allow sampling
+  delay(1);
 }
